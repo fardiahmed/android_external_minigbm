@@ -37,6 +37,7 @@ extern "C" {
 #include <glob.h>
 #include <iterator>
 #include <linux/dma-buf.h>
+#include <linux/dma-heap.h>
 #include <log/log.h>
 #include <stdlib.h>
 #include <string.h>
@@ -414,25 +415,46 @@ static int gbm_mesa_alloc_dumb(struct bo *bo, uint32_t width, uint32_t height,
 	create_arg.height = 1;
 	create_arg.bpp = 8;
 
+	int prime_fd = -1;
 	ret = drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_arg);
 	if (ret) {
-		drv_loge("DRM_IOCTL_MODE_CREATE_DUMB failed: %s (fd=%d)", strerror(errno), fd);
-		return -errno;
-	}
+		/* Render node without dumb buffers (ENOSYS): use a linear system-heap dma-buf. */
+		int err = errno;
+		struct dma_heap_allocation_data heap_data = {};
+		int heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+		if (heap_fd < 0) {
+			drv_loge("DRM_IOCTL_MODE_CREATE_DUMB failed: %s (fd=%d), no dma-buf heap: %s",
+				 strerror(err), fd, strerror(errno));
+			return -err;
+		}
+		heap_data.len = ALIGN(bo->meta.total_size, 4096);
+		heap_data.fd_flags = O_RDWR | O_CLOEXEC;
+		ret = ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &heap_data);
+		close(heap_fd);
+		if (ret) {
+			drv_loge("DRM_IOCTL_MODE_CREATE_DUMB failed: %s (fd=%d), dma-buf heap alloc "
+				 "of %llu bytes failed: %s",
+				 strerror(err), fd, (unsigned long long)heap_data.len,
+				 strerror(errno));
+			return -errno;
+		}
+		prime_fd = heap_data.fd;
+		drv_logv("YUV bo 0x%x %ux%u: %zu bytes from the system dma-buf heap", format,
+			 width, height, (size_t)heap_data.len);
+	} else {
+		/* Export as dma-buf */
+		ret = drmPrimeHandleToFD(fd, create_arg.handle, DRM_CLOEXEC | DRM_RDWR, &prime_fd);
+		if (ret) {
+			drv_loge("drmPrimeHandleToFD failed: %s", strerror(errno));
+			struct drm_mode_destroy_dumb destroy_arg = { .handle = create_arg.handle };
+			drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_arg);
+			return -errno;
+		}
 
-	/* Export as dma-buf */
-	int prime_fd = -1;
-	ret = drmPrimeHandleToFD(fd, create_arg.handle, DRM_CLOEXEC | DRM_RDWR, &prime_fd);
-	if (ret) {
-		drv_loge("drmPrimeHandleToFD failed: %s", strerror(errno));
+		/* Destroy the GEM handle - we'll use the dma-buf fd from now on */
 		struct drm_mode_destroy_dumb destroy_arg = { .handle = create_arg.handle };
 		drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_arg);
-		return -errno;
 	}
-
-	/* Destroy the GEM handle - we'll use the dma-buf fd from now on */
-	struct drm_mode_destroy_dumb destroy_arg = { .handle = create_arg.handle };
-	drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_arg);
 
 	auto priv = new GbmMesaBoPriv();
 	for (size_t plane = 0; plane < bo->meta.num_planes; plane++) {
