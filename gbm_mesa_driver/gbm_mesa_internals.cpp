@@ -27,6 +27,7 @@ extern "C" {
 #include "util.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cutils/properties.h>
 #include <dlfcn.h>
@@ -385,6 +386,17 @@ struct GbmMesaBoPriv {
 	bool use_dumb = false;  /* true if allocated via DRM dumb buffer */
 };
 
+/* drv refcounts BOs and caches mappings by handle: give each BO a unique non-zero one. */
+static void gbm_mesa_assign_bo_handle(struct bo *bo)
+{
+	static std::atomic<uint32_t> next_handle{ 1 };
+	uint32_t handle;
+	do {
+		handle = next_handle.fetch_add(1, std::memory_order_relaxed);
+	} while (handle == 0);
+	bo->handle.u32 = handle;
+}
+
 /* Allocate a dumb buffer via DRM for formats not supported by GBM */
 static int gbm_mesa_alloc_dumb(struct bo *bo, uint32_t width, uint32_t height,
 			       uint32_t format, uint64_t use_flags,
@@ -467,6 +479,7 @@ static int gbm_mesa_alloc_dumb(struct bo *bo, uint32_t width, uint32_t height,
 	priv->use_dumb = true;
 	bo->meta.format_modifier = DRM_FORMAT_MOD_LINEAR;
 	bo->priv = priv;
+	gbm_mesa_assign_bo_handle(bo);
 
 	drv_logv("Allocated dumb buffer: %ux%u format=0x%x size=%u",
 		 width, height, format, bo->meta.total_size);
@@ -582,6 +595,7 @@ int gbm_mesa_bo_create(struct bo *bo, uint32_t width, uint32_t height, uint32_t 
 	bo->meta.format_modifier = alloc_args.out_modifier;
 
 	bo->priv = priv;
+	gbm_mesa_assign_bo_handle(bo);
 	priv->drv = drv;
 
 	return 0;
@@ -618,6 +632,7 @@ int gbm_mesa_bo_import(struct bo *bo, struct drv_import_fd_data *data)
 	}
 
 	bo->priv = priv;
+	gbm_mesa_assign_bo_handle(bo);
 
 	return 0;
 }
